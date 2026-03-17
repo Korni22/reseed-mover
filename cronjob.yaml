@@ -32,8 +32,8 @@ spec:
           restartPolicy: Never
           containers:
             - name: reseed-mover
-              image: reseed-mover:latest       # point to your registry
-              imagePullPolicy: IfNotPresent
+              image: docker pull ghcr.io/korni22/reseed-mover:main
+              imagePullPolicy: Always
               env:
                 - name: RTORRENT_XMLRPC_URL
                   value: "http://rutorrent.default.svc.cluster.local:8080/RPC2"
