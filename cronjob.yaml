@@ -1,0 +1,82 @@
+---
+# reseed-mover CronJob
+# Runs every 6 hours to repoint completed torrents to their *arr library paths.
+#
+# Prerequisites:
+#   kubectl create secret generic arr-api-keys \
+#     --from-literal=RADARR_API_KEY=your-radarr-key \
+#     --from-literal=SONARR_API_KEY=your-sonarr-key
+#
+# Adjust the volume mounts to match your actual PV/PVC setup.
+# The pod needs read access to both /downloads and /media so it can
+# verify files before repointing.
+
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: reseed-mover
+  labels:
+    app.kubernetes.io/name: reseed-mover
+    app.kubernetes.io/part-of: arr-stack
+spec:
+  schedule: "0 */6 * * *"        # every 6h — tune to taste
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 300
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: reseed-mover
+              image: reseed-mover:latest       # point to your registry
+              imagePullPolicy: IfNotPresent
+              env:
+                - name: RTORRENT_XMLRPC_URL
+                  value: "http://rutorrent.default.svc.cluster.local:8080/RPC2"
+                - name: RADARR_URL
+                  value: "http://radarr.default.svc.cluster.local:7878"
+                - name: SONARR_URL
+                  value: "http://sonarr.default.svc.cluster.local:8989"
+                - name: RADARR_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: arr-api-keys
+                      key: RADARR_API_KEY
+                - name: SONARR_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: arr-api-keys
+                      key: SONARR_API_KEY
+                - name: DOWNLOADS_BASE
+                  value: "/downloads/complete"
+                - name: DRY_RUN
+                  value: "false"
+                - name: CLEANUP_OLD
+                  value: "true"
+                - name: VERIFY_FILES
+                  value: "true"
+              volumeMounts:
+                - name: downloads
+                  mountPath: /downloads
+                  readOnly: true
+                - name: media
+                  mountPath: /media
+                  readOnly: true
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  cpu: 200m
+                  memory: 128Mi
+          volumes:
+            - name: downloads
+              persistentVolumeClaim:
+                claimName: downloads-pvc       # adjust to your PVC name
+            - name: media
+              persistentVolumeClaim:
+                claimName: media-pvc           # adjust to your PVC name
