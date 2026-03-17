@@ -221,16 +221,15 @@ def lookup_sonarr(torrent: Torrent) -> str | None:
         # Season pack — point to the series root; files span season dirs
         return series.get("path")
 
-    # Single episode — find the specific episode file
+    # Single episode — look up the episode to get its file path directly
     episode_id = records[0].get("episodeId")
     if episode_id:
-        episode_files = arr_get("sonarr", "episodefile", {"seriesId": series_id})
-        for ef in episode_files:
+        episode = arr_get("sonarr", f"episode/{episode_id}")
+        file_id = episode.get("episodeFileId")
+        if file_id:
+            ef = arr_get("sonarr", f"episodefile/{file_id}")
             if ef.get("path"):
-                # Check if this file corresponds to our episode
-                eps = ef.get("episodes", [])
-                if any(e.get("id") == episode_id for e in eps):
-                    return str(Path(ef["path"]).parent)
+                return str(Path(ef["path"]).parent)
 
     return series.get("path")
 
