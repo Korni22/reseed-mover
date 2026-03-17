@@ -82,19 +82,15 @@ def get_rtorrent():
     return xmlrpc.client.ServerProxy(RTORRENT_URL)
 
 
-def parse_service_from_label(label: str) -> str | None:
-    """
-    Extract the *arr service name from the torrent label.
+ACCEPTED_LABELS = {
+    "radarr_imported": "radarr",
+    "sonarr_imported": "sonarr",
+}
 
-    After import, *arr changes the label to '<service>_imported'
-    (e.g. 'radarr_imported', 'sonarr_imported').
-    """
-    label = label.strip().lower()
-    if label.endswith("_imported"):
-        service = label.removesuffix("_imported")
-        if service in SERVICES:
-            return service
-    return None
+
+def parse_service_from_label(label: str) -> str | None:
+    """Map a torrent label to its *arr service name, or None if irrelevant."""
+    return ACCEPTED_LABELS.get(label.strip().lower())
 
 
 def get_pending_torrents(rt) -> list[Torrent]:
