@@ -7,7 +7,6 @@
 #     --from-literal=RADARR_API_KEY=your-radarr-key \
 #     --from-literal=SONARR_API_KEY=your-sonarr-key
 #
-# Adjust the volume mounts to match your actual PV/PVC setup.
 # The pod needs read access to both /downloads and /media so it can
 # verify files before repointing.
 
@@ -15,11 +14,12 @@ apiVersion: batch/v1
 kind: CronJob
 metadata:
   name: reseed-mover
+  namespace: torrent
   labels:
     app.kubernetes.io/name: reseed-mover
     app.kubernetes.io/part-of: arr-stack
 spec:
-  schedule: "0 */6 * * *"        # every 6h — tune to taste
+  schedule: "0 */6 * * *" # every 6h — tune to taste
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 3
   failedJobsHistoryLimit: 3
@@ -30,17 +30,19 @@ spec:
       template:
         spec:
           restartPolicy: Never
+          imagePullSecrets:
+            - name: github-container-registry
           containers:
             - name: reseed-mover
-              image: docker pull ghcr.io/korni22/reseed-mover:main
+              image: ghcr.io/korni22/reseed-mover:main
               imagePullPolicy: Always
               env:
                 - name: RTORRENT_XMLRPC_URL
-                  value: "http://rutorrent.default.svc.cluster.local:8080/RPC2"
+                  value: "http://rtorrent-1.torrent.svc.cluster.local:8080/plugins/httprpc/action.php"
                 - name: RADARR_URL
-                  value: "http://radarr.default.svc.cluster.local:7878"
+                  value: "http://radarr.radarr.svc.cluster.local:7878"
                 - name: SONARR_URL
-                  value: "http://sonarr.default.svc.cluster.local:8989"
+                  value: "http://sonarr.sonarr.svc.cluster.local:8989"
                 - name: RADARR_API_KEY
                   valueFrom:
                     secretKeyRef:
@@ -54,7 +56,7 @@ spec:
                 - name: DOWNLOADS_BASE
                   value: "/downloads/complete"
                 - name: DRY_RUN
-                  value: "false"
+                  value: "true"
                 - name: CLEANUP_OLD
                   value: "true"
                 - name: VERIFY_FILES
@@ -75,8 +77,8 @@ spec:
                   memory: 128Mi
           volumes:
             - name: downloads
-              persistentVolumeClaim:
-                claimName: downloads-pvc       # adjust to your PVC name
+              hostPath:
+                path: /mnt/downloads_1
             - name: media
-              persistentVolumeClaim:
-                claimName: media-pvc           # adjust to your PVC name
+              hostPath:
+                path: /mnt/media
