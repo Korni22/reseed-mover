@@ -27,6 +27,7 @@ Environment variables:
                         until it's seeded this long
   MIN_SEED_RATIO        Same, gated on ratio instead   (default: 0 = off)
                         (both 0 = old behavior, no gate)
+bump
 """
 
 import xmlrpc.client
