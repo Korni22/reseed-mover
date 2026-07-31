@@ -61,6 +61,8 @@ spec:
                   value: "true"
                 - name: VERIFY_FILES
                   value: "true"
+                - name: MIN_SEED_HOURS
+                  value: "140"
               volumeMounts:
                 - name: downloads
                   mountPath: /downloads
