@@ -23,6 +23,10 @@ Environment variables:
   DRY_RUN               Log only, don't change        (default: false)
   CLEANUP_OLD           Delete old copy after move    (default: true)
   VERIFY_FILES          Check files exist before move (default: true)
+  MIN_SEED_HOURS        Don't erase/cleanup a torrent (default: 0 = off)
+                        until it's seeded this long
+  MIN_SEED_RATIO        Same, gated on ratio instead   (default: 0 = off)
+                        (both 0 = old behavior, no gate)
 """
 
 import xmlrpc.client
@@ -31,6 +35,7 @@ import os
 import shutil
 import logging
 import sys
+import time
 from pathlib import Path
 from dataclasses import dataclass, field
 
@@ -47,6 +52,8 @@ DOWNLOADS_BASE = os.getenv("DOWNLOADS_BASE", "/downloads/complete")
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 CLEANUP_OLD = os.getenv("CLEANUP_OLD", "true").lower() == "true"
 VERIFY_FILES = os.getenv("VERIFY_FILES", "true").lower() == "true"
+MIN_SEED_HOURS = float(os.getenv("MIN_SEED_HOURS", "0"))
+MIN_SEED_RATIO = float(os.getenv("MIN_SEED_RATIO", "0"))
 
 SERVICES = {
     "radarr": {
@@ -130,13 +137,37 @@ def get_torrent_files(rt, info_hash: str) -> list[dict]:
     return [{"path": path, "size": size} for path, size in results]
 
 
-def update_torrent_directory(rt, torrent: Torrent, new_dir: str) -> bool:
-    """Stop → set directory → check hash → start."""
+def update_torrent_directory(rt, torrent: Torrent, new_dir: str,
+                              hash_timeout: float = 120.0) -> bool:
+    """
+    Stop → set directory → check hash → WAIT for it to actually finish → start.
+
+    d.check_hash() only triggers hashing; it returns immediately, before
+    rTorrent has confirmed the files at new_dir actually match the torrent.
+    Trusting that immediate return let cleanup() delete the only remaining
+    copy before the hash check had a chance to fail. This polls d.hashing()
+    until it's done and checks d.complete() before reporting success, so a
+    failed rehash (permissions, a sync lag on the destination, etc.) leaves
+    the old copy alone instead of losing the file entirely.
+    """
     h = torrent.info_hash
     try:
         rt.d.stop(h)
         rt.d.directory.set(h, new_dir)
         rt.d.check_hash(h)
+
+        deadline = time.time() + hash_timeout
+        while rt.d.hashing(h) != 0:
+            if time.time() > deadline:
+                log.error("  Hash check timed out after %.0fs — NOT cleaning up old copy", hash_timeout)
+                return False
+            time.sleep(2)
+
+        if rt.d.complete(h) != 1:
+            log.error("  Hash check finished but torrent is incomplete at new location — "
+                       "NOT cleaning up old copy")
+            return False
+
         rt.d.start(h)
         return True
     except Exception as e:
@@ -146,6 +177,31 @@ def update_torrent_directory(rt, torrent: Torrent, new_dir: str) -> bool:
         except Exception:
             pass
         return False
+
+
+def seed_goal_met(rt, info_hash: str) -> tuple[bool, str]:
+    """
+    Check whether MIN_SEED_HOURS / MIN_SEED_RATIO have been satisfied.
+
+    Both are 0 (disabled) by default, which reproduces the old behavior —
+    set at least one via env vars to stop erase_torrent()/cleanup() from
+    running before your tracker's seeding requirements are met.
+    """
+    if MIN_SEED_HOURS <= 0 and MIN_SEED_RATIO <= 0:
+        return True, "no seed gate configured"
+
+    finished_ts = rt.d.timestamp.finished(info_hash)
+    if finished_ts <= 0:
+        return False, "rTorrent hasn't marked this finished yet"
+
+    seeded_hours = (time.time() - finished_ts) / 3600
+    ratio = rt.d.ratio(info_hash) / 1000.0  # rTorrent reports ratio × 1000
+
+    if MIN_SEED_HOURS > 0 and seeded_hours < MIN_SEED_HOURS:
+        return False, f"seeded {seeded_hours:.1f}h / needs {MIN_SEED_HOURS}h (ratio {ratio:.2f})"
+    if MIN_SEED_RATIO > 0 and ratio < MIN_SEED_RATIO:
+        return False, f"ratio {ratio:.2f} / needs {MIN_SEED_RATIO} (seeded {seeded_hours:.1f}h)"
+    return True, f"seeded {seeded_hours:.1f}h, ratio {ratio:.2f} — goal met"
 
 
 # ─── *arr API helpers ────────────────────────────────────────────────────────
@@ -396,6 +452,14 @@ def main() -> int:
         # line up — so we erase the torrent and clean up instead.
         if t.is_multi_file:
             log.info("  Multi-file torrent — *arr renamed folder, can't reseed")
+
+            met, reason = seed_goal_met(rt, t.info_hash)
+            if not met:
+                log.info("  Seed goal not met yet (%s) — leaving in place", reason)
+                stats["skipped"] += 1
+                continue
+            log.info("  Seed goal check: %s", reason)
+
             if DRY_RUN:
                 log.info("  [DRY RUN] Would erase torrent and delete old files")
                 stats["erased"] += 1
