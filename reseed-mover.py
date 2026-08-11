@@ -170,6 +170,10 @@ def update_torrent_directory(rt, torrent: Torrent, new_dir: str,
             return False
 
         rt.d.start(h)
+        try:
+            rt.session.save()
+        except Exception as e:
+            log.warning("  Could not save session (repoint may not survive a restart): %s", e)
         return True
     except Exception as e:
         log.error("  XMLRPC error: %s", e)
@@ -213,6 +217,20 @@ def arr_get(service: str, endpoint: str, params: dict | None = None) -> dict | l
     resp = requests.get(url, headers={"X-Api-Key": cfg["api_key"]}, params=params or {})
     resp.raise_for_status()
     return resp.json()
+
+
+def log_sonarr_naming_config() -> None:
+    """
+    Best-effort, informational only: log Sonarr's renameEpisodes setting
+    once at startup, to help interpret why season-pack structural-match
+    checks succeed or fail. Not required for correctness — the runtime
+    directory check in multi_file_structural_match is authoritative.
+    """
+    try:
+        cfg = arr_get("sonarr", "config/naming")
+        log.info("Sonarr renameEpisodes=%s (informational only)", cfg.get("renameEpisodes"))
+    except Exception as e:
+        log.debug("Could not fetch Sonarr naming config: %s", e)
 
 
 def lookup_radarr(torrent: Torrent) -> str | None:
@@ -397,6 +415,7 @@ def main() -> int:
         log.info("══════ DRY RUN — no changes will be made ══════")
 
     rt = get_rtorrent()
+    log_sonarr_naming_config()
     torrents = get_pending_torrents(rt)
 
     stats = {"repointed": 0, "erased": 0, "skipped": 0, "failed": 0}
