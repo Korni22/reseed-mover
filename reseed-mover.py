@@ -10,7 +10,11 @@ label to '<service>_imported' (e.g. radarr_imported). This script:
   3. Verifies the file(s) exist at the new location
   4a. Single-file, or a multi-file season pack whose release-name subfolder
       is still intact under the target directory: stops torrent, updates
-      d.directory, rehashes, restarts.
+      d.directory, rehashes, restarts. Single-file Sonarr episodes (and
+      multi-file torrents, which are gated regardless of service) are held
+      until MIN_SEED_HOURS/MIN_SEED_RATIO are met; Radarr single-file
+      torrents (movies) are not gated — repointing doesn't interrupt
+      seeding, so movies repoint immediately.
   4b. Multi-file torrents where *arr flattened files directly into the
       target folder (no intact release subfolder) — erases the torrent
       from rTorrent instead. rTorrent has no per-file path override
@@ -527,6 +531,16 @@ def main() -> int:
             continue
 
         # ── Single-file torrents ──────────────────────────────────────
+        # Sonarr episodes are held until the seed goal is met; movies
+        # repoint immediately since it doesn't interrupt their seeding.
+        if t.service == "sonarr":
+            met, reason = seed_goal_met(rt, t.info_hash)
+            if not met:
+                log.info("  Seed goal not met yet (%s) — leaving in place", reason)
+                stats["skipped"] += 1
+                continue
+            log.info("  Seed goal check: %s", reason)
+
         # Verify the file exists at the library path with matching name.
         if VERIFY_FILES and not verify_files_exist(t, new_path):
             log.warning("  File verification failed — skipping (rename mismatch?)")
