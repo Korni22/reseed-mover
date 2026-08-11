@@ -7,8 +7,8 @@
 #     --from-literal=RADARR_API_KEY=your-radarr-key \
 #     --from-literal=SONARR_API_KEY=your-sonarr-key
 #
-# The pod needs read access to both /downloads and /media so it can
-# verify files before repointing.
+# The pod needs read-write access to /downloads (cleanup() deletes the old
+# copy there) and read-only access to /media (verify files before repointing).
 
 apiVersion: batch/v1
 kind: CronJob
@@ -66,7 +66,7 @@ spec:
               volumeMounts:
                 - name: downloads
                   mountPath: /downloads
-                  readOnly: true
+                  readOnly: false
                 - name: media
                   mountPath: /media
                   readOnly: true
