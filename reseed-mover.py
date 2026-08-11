@@ -8,9 +8,13 @@ label to '<service>_imported' (e.g. radarr_imported). This script:
      still pointing at /downloads/complete/
   2. Uses the torrent hash to look up the imported path via the *arr API
   3. Verifies the file(s) exist at the new location
-  4a. Single-file: stops torrent, updates d.directory, rehashes, restarts
-  4b. Multi-file (subfolder): *arr renames the folder so rTorrent can't
-      reseed — erases the torrent from rTorrent instead
+  4a. Single-file, or a multi-file season pack whose release-name subfolder
+      is still intact under the target directory: stops torrent, updates
+      d.directory, rehashes, restarts.
+  4b. Multi-file torrents where *arr flattened files directly into the
+      target folder (no intact release subfolder) — erases the torrent
+      from rTorrent instead. rTorrent has no per-file path override
+      (f.path.set doesn't exist), so this case can't be reseeded in place.
   5. Deletes the old copy from /downloads/complete/
 
 Environment variables:
@@ -154,6 +158,12 @@ def update_torrent_directory(rt, torrent: Torrent, new_dir: str,
     h = torrent.info_hash
     try:
         rt.d.stop(h)
+        # d.directory.set auto-appends the torrent's name for multi-file
+        # torrents, so new_dir/torrent.name/... is exactly what we want —
+        # this function is reused unchanged for season-pack repoints.
+        # (d.directory_base.set sets the root directory without that
+        # auto-append; not needed here since this only runs once the
+        # release-name subfolder is confirmed intact under new_dir.)
         rt.d.directory.set(h, new_dir)
         rt.d.check_hash(h)
 
@@ -267,10 +277,15 @@ def lookup_radarr(torrent: Torrent) -> str | None:
 
 def lookup_sonarr(torrent: Torrent) -> str | None:
     """
-    Find the library path for a Sonarr-imported episode/season by download hash.
+    Find the library path for a Sonarr-imported episode or season pack by
+    download hash.
 
-    For single-episode torrents → returns the season folder.
-    For season packs → returns the series root folder.
+    Resolves via the first history record's episode file path's parent
+    directory — this naturally yields the season folder for a pack (all its
+    episodes share one season dir) and the containing folder for a single
+    episode, with no need to branch on is_multi_file or reconstruct a
+    "Season NN" path manually. Falls back to the series root only if no
+    episode-file detail is available yet.
     """
     history = arr_get("sonarr", "history", {
         "downloadId": torrent.info_hash,
@@ -286,13 +301,6 @@ def lookup_sonarr(torrent: Torrent) -> str | None:
     if not series_id:
         return None
 
-    series = arr_get("sonarr", f"series/{series_id}")
-
-    if torrent.is_multi_file:
-        # Season pack — point to the series root; files span season dirs
-        return series.get("path")
-
-    # Single episode — look up the episode to get its file path directly
     episode_id = records[0].get("episodeId")
     if episode_id:
         episode = arr_get("sonarr", f"episode/{episode_id}")
@@ -302,6 +310,8 @@ def lookup_sonarr(torrent: Torrent) -> str | None:
             if ef.get("path"):
                 return str(Path(ef["path"]).parent)
 
+    # Fallback: no episode-file detail yet — best we can do is series root
+    series = arr_get("sonarr", f"series/{series_id}")
     return series.get("path")
 
 
@@ -313,37 +323,37 @@ LOOKUP = {
 
 # ─── Verification ────────────────────────────────────────────────────────────
 
-def verify_files_exist(torrent: Torrent, new_dir: str) -> bool:
+def multi_file_structural_match(torrent: Torrent, new_dir: str, deep_verify: bool = True) -> bool:
     """
-    Confirm that the torrent's files actually exist at the new location.
+    True only if new_dir/torrent.name exists as a directory AND (when
+    deep_verify) every file in the torrent is present at its original
+    relative path underneath it.
 
-    This prevents rTorrent from failing the hash check and going into an
-    error state. For multi-file torrents we check that the torrent's root
-    folder (torrent.name) exists as a subdirectory.
+    d.directory.set auto-appends torrent.name for multi-file torrents, so a
+    repoint only lines up when *arr left the release-name subfolder intact
+    rather than flattening files directly into the target folder — the
+    latter (common) case can't be reseeded in place since rTorrent has no
+    per-file path override.
     """
     new_path = Path(new_dir)
-
-    if torrent.is_multi_file:
-        # d.directory for multi-file is the *parent* of the torrent folder,
-        # so we expect new_dir/torrent.name/ to exist
-        root = new_path / torrent.name
-        if not root.is_dir():
-            # *arr may have renamed the folder — check if files exist
-            # directly under new_dir instead
-            for f in torrent.files:
-                # Try without the torrent-name prefix
-                parts = Path(f["path"]).parts
-                if len(parts) > 1:
-                    candidate = new_path / Path(*parts[1:])
-                else:
-                    candidate = new_path / f["path"]
-                if candidate.exists():
-                    continue
-                log.warning("  File not found: %s", candidate)
-                return False
-            log.info("  Files found (renamed folder)")
-            return True
+    root = new_path / torrent.name
+    if not root.is_dir():
+        return False
+    if not deep_verify:
         return True
+    for f in torrent.files:
+        if not (new_path / f["path"]).exists():
+            return False
+    return True
+
+
+def verify_files_exist(torrent: Torrent, new_dir: str) -> bool:
+    """
+    Confirm that the torrent's single file actually exists at the new
+    location. Prevents rTorrent from failing the hash check and going into
+    an error state.
+    """
+    new_path = Path(new_dir)
 
     # Single file: check torrent.name exists in new_dir
     target = new_path / torrent.name
@@ -467,18 +477,40 @@ def main() -> int:
         # ── Multi-file torrents (subfolder) ───────────────────────────
         # rTorrent resolves files as d.directory/f.path, and f.path
         # includes the torrent's original root folder name
-        # (e.g. "SomeRelease-GROUP/movie.mkv").  Since *arr renames
-        # that folder, repointing d.directory can't make the paths
-        # line up — so we erase the torrent and clean up instead.
+        # (e.g. "SomeRelease-GROUP/movie.mkv"). If *arr left that folder
+        # intact under the target directory, d.directory.set + rehash can
+        # still reseed in place (see update_torrent_directory). If *arr
+        # flattened the files directly into the target folder instead (the
+        # common case — rTorrent has no per-file path override), we fall
+        # back to erasing the torrent and cleaning up.
         if t.is_multi_file:
-            log.info("  Multi-file torrent — *arr renamed folder, can't reseed")
-
             met, reason = seed_goal_met(rt, t.info_hash)
             if not met:
                 log.info("  Seed goal not met yet (%s) — leaving in place", reason)
                 stats["skipped"] += 1
                 continue
             log.info("  Seed goal check: %s", reason)
+
+            structural_match = multi_file_structural_match(t, new_path, deep_verify=VERIFY_FILES)
+
+            if structural_match:
+                log.info("  Multi-file torrent — release subfolder intact, attempting repoint")
+
+                if DRY_RUN:
+                    log.info("  [DRY RUN] Would repoint directory (season pack)")
+                    stats["repointed"] += 1
+                    continue
+
+                if update_torrent_directory(rt, t, new_path):
+                    log.info("  ✓ Repointed (season pack), still seeding")
+                    stats["repointed"] += 1
+                    if CLEANUP_OLD:
+                        cleanup(t)
+                else:
+                    stats["failed"] += 1
+                continue
+
+            log.info("  Multi-file torrent — *arr flattened folder, can't reseed")
 
             if DRY_RUN:
                 log.info("  [DRY RUN] Would erase torrent and delete old files")
