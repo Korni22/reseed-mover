@@ -35,7 +35,17 @@ Environment variables:
                         until it's seeded this long
   MIN_SEED_RATIO        Same, gated on ratio instead   (default: 0 = off)
                         (both 0 = old behavior, no gate)
-bump
+  HASH_TIMEOUT          Seconds to wait for a rehash   (default: 600)
+                        before leaving it to the next run
+  RUN_BUDGET            Seconds after which no new     (default: 2400)
+                        repoints are started this run
+                        (keep below the Job's activeDeadlineSeconds)
+
+Repoints are resumable: before touching a torrent, its original d.directory
+is stored in d.custom=reseed_mover_old_dir. Each run first resolves any
+torrent still carrying that marker (hash timed out, job killed, XMLRPC
+error) — finishing the repoint if the rehash completed at the new location,
+reverting to the old directory otherwise.
 """
 
 import xmlrpc.client
@@ -63,6 +73,16 @@ CLEANUP_OLD = os.getenv("CLEANUP_OLD", "true").lower() == "true"
 VERIFY_FILES = os.getenv("VERIFY_FILES", "true").lower() == "true"
 MIN_SEED_HOURS = float(os.getenv("MIN_SEED_HOURS", "0"))
 MIN_SEED_RATIO = float(os.getenv("MIN_SEED_RATIO", "0"))
+HASH_TIMEOUT = float(os.getenv("HASH_TIMEOUT", "600"))
+RUN_BUDGET = float(os.getenv("RUN_BUDGET", "2400"))
+
+# d.custom key holding a torrent's original d.directory while a repoint is
+# in flight. Non-empty means "unresolved repoint" — see resume_interrupted().
+MARKER = "reseed_mover_old_dir"
+# Set when a repoint had to be reverted. Such torrents are skipped from then
+# on — retrying would stop seeding for two rehashes every run and fail the
+# same way. Clear it (d.custom.set=reseed_mover_gave_up,"") to retry.
+GAVE_UP = "reseed_mover_gave_up"
 
 SERVICES = {
     "radarr": {
@@ -120,12 +140,17 @@ def get_pending_torrents(rt) -> list[Torrent]:
         "d.custom1=",        # label set by *arr
         "d.is_multi_file=",
         "d.size_bytes=",
+        f"d.custom={GAVE_UP}",
     )
 
     pending = []
-    for info_hash, name, directory, label, is_multi, size in results:
+    gave_up = 0
+    for info_hash, name, directory, label, is_multi, size, failed_before in results:
         service = parse_service_from_label(label)
         if service and directory.startswith(DOWNLOADS_BASE):
+            if failed_before:
+                gave_up += 1
+                continue
             pending.append(Torrent(
                 info_hash=info_hash.upper(),
                 name=name,
@@ -136,7 +161,8 @@ def get_pending_torrents(rt) -> list[Torrent]:
                 size_bytes=size,
             ))
 
-    log.info("Found %d imported torrent(s) still in %s", len(pending), DOWNLOADS_BASE)
+    log.info("Found %d imported torrent(s) still in %s (%d more skipped: earlier repoint reverted)",
+             len(pending), DOWNLOADS_BASE, gave_up)
     return pending
 
 
@@ -146,56 +172,155 @@ def get_torrent_files(rt, info_hash: str) -> list[dict]:
     return [{"path": path, "size": size} for path, size in results]
 
 
-def update_torrent_directory(rt, torrent: Torrent, new_dir: str,
-                              hash_timeout: float = 120.0) -> bool:
+def content_root(directory: str, name: str, is_multi_file: bool) -> Path:
     """
-    Stop → set directory → check hash → WAIT for it to actually finish → start.
+    The torrent's data on disk. For multi-file torrents rTorrent's
+    d.directory already ends in the release name (and f.path is relative to
+    it); for single-file torrents d.directory is the containing folder.
+    """
+    return Path(directory) if is_multi_file else Path(directory) / name
 
-    d.check_hash() only triggers hashing; it returns immediately, before
-    rTorrent has confirmed the files at new_dir actually match the torrent.
-    Trusting that immediate return let cleanup() delete the only remaining
-    copy before the hash check had a chance to fail. This polls d.hashing()
-    until it's done and checks d.complete() before reporting success, so a
-    failed rehash (permissions, a sync lag on the destination, etc.) leaves
-    the old copy alone instead of losing the file entirely.
+
+def save_session(rt, h: str) -> None:
+    try:
+        rt.d.save_full_session(h)
+    except Exception as e:
+        log.warning("  Could not save session (state may not survive a restart): %s", e)
+
+
+def hash_state(rt, h: str) -> str:
+    """
+    'hashing', 'failed', 'complete' or 'incomplete'.
+
+    A failed hash check (I/O error) leaves d.hashing non-zero and sets
+    d.hashing_failed instead, so that must be checked first or a failure
+    looks like "still hashing" forever.
+    """
+    if rt.d.hashing_failed(h):
+        return "failed"
+    if rt.d.hashing(h) != 0:
+        return "hashing"
+    return "complete" if rt.d.complete(h) == 1 else "incomplete"
+
+
+def revert_repoint(rt, h: str, old_dir: str) -> None:
+    """
+    Point the torrent back at old_dir, rehash and restart it.
+
+    Only call this when the torrent isn't mid-hash: d.close on a torrent
+    that is still hashing (and hasn't failed) trips an internal_error in
+    rTorrent's close_throw(), which aborts the whole client.
+    d.directory_base.set takes the full path without appending the name,
+    which matches what d.directory reported for both single- and
+    multi-file torrents.
+    """
+    rt.d.stop(h)
+    rt.d.close(h)
+    rt.d.directory_base.set(h, old_dir)
+    rt.d.check_hash(h)  # no-op if hashing already queued (failed state)
+    rt.d.start(h)       # deferred by rTorrent until the rehash finishes
+    rt.d.custom.set(h, GAVE_UP, "1")
+    rt.d.custom.set(h, MARKER, "")
+    save_session(rt, h)
+
+
+def resolve_repoint(rt, h: str, old_dir: str, state: str) -> str:
+    """Act on a finished (or still running) rehash. Returns ok/failed/pending."""
+    if state == "hashing":
+        log.warning("  Still hashing — leaving it for the next run to resolve")
+        return "pending"
+    if state == "complete":
+        rt.d.start(h)
+        rt.d.custom.set(h, MARKER, "")
+        save_session(rt, h)
+        return "ok"
+    log.error("  Hash check %s at new location — reverting to %s, NOT cleaning up",
+              "failed" if state == "failed" else "found missing data", old_dir)
+    revert_repoint(rt, h, old_dir)
+    return "failed"
+
+
+def repoint_torrent(rt, torrent: Torrent, new_dir: str) -> str:
+    """
+    Stop → close → set directory → rehash → wait → start (or revert).
+
+    Returns 'ok', 'failed' or 'pending'. The old directory is recorded in
+    MARKER before anything changes, so if the rehash outlasts HASH_TIMEOUT,
+    the job gets killed, or XMLRPC errors out midway, the next run's
+    resume_interrupted() finishes or reverts it — the torrent is never left
+    stopped and pointing at a location nothing will look at again.
+
+    The torrent must be closed, not just stopped: libtorrent refuses to
+    change the root dir of an open download. d.directory.set auto-appends
+    the release name for multi-file torrents, which is what the season-pack
+    repoint wants (it only runs once new_dir/<name>/ is confirmed intact).
     """
     h = torrent.info_hash
     try:
+        if rt.d.hashing(h) != 0:
+            log.warning("  Torrent is already hashing — not touching it this run")
+            return "pending"
+
+        rt.d.custom.set(h, MARKER, torrent.directory)
+        save_session(rt, h)
         rt.d.stop(h)
-        # d.directory.set auto-appends the torrent's name for multi-file
-        # torrents, so new_dir/torrent.name/... is exactly what we want —
-        # this function is reused unchanged for season-pack repoints.
-        # (d.directory_base.set sets the root directory without that
-        # auto-append; not needed here since this only runs once the
-        # release-name subfolder is confirmed intact under new_dir.)
+        rt.d.close(h)
         rt.d.directory.set(h, new_dir)
         rt.d.check_hash(h)
 
-        deadline = time.time() + hash_timeout
-        while rt.d.hashing(h) != 0:
-            if time.time() > deadline:
-                log.error("  Hash check timed out after %.0fs — NOT cleaning up old copy", hash_timeout)
-                return False
+        deadline = time.monotonic() + HASH_TIMEOUT
+        while (state := hash_state(rt, h)) == "hashing" and time.monotonic() < deadline:
             time.sleep(2)
 
-        if rt.d.complete(h) != 1:
-            log.error("  Hash check finished but torrent is incomplete at new location — "
-                       "NOT cleaning up old copy")
-            return False
-
-        rt.d.start(h)
-        try:
-            rt.session.save()
-        except Exception as e:
-            log.warning("  Could not save session (repoint may not survive a restart): %s", e)
-        return True
+        return resolve_repoint(rt, h, torrent.directory, state)
     except Exception as e:
-        log.error("  XMLRPC error: %s", e)
+        # Deliberately no d.start here: if the directory already changed,
+        # starting would make rTorrent download into the library path.
+        log.error("  XMLRPC error: %s — leaving it for the next run to resolve", e)
+        return "failed"
+
+
+def resume_interrupted(rt, stats: dict) -> None:
+    """Finish or revert repoints a previous run left unresolved (see MARKER)."""
+    rows = rt.d.multicall2(
+        "", "main",
+        "d.hash=", "d.name=", "d.directory=", "d.is_multi_file=",
+        f"d.custom={MARKER}",
+    )
+    for h, name, directory, is_multi, old_dir in rows:
+        if not old_dir:
+            continue
+        log.info("▶ %s  unresolved repoint  hash=%s", name, h[:8])
+        log.info("  %s → %s", old_dir, directory)
+
+        if DRY_RUN:
+            log.info("  [DRY RUN] Would resolve interrupted repoint")
+            stats["pending"] += 1
+            continue
+
         try:
-            rt.d.start(h)  # best-effort restart on failure
-        except Exception:
-            pass
-        return False
+            if directory == old_dir:
+                # Interrupted before the directory changed — just undo the stop.
+                log.info("  Directory never changed, restarting")
+                rt.d.start(h)
+                rt.d.custom.set(h, MARKER, "")
+                save_session(rt, h)
+                stats["skipped"] += 1
+                continue
+
+            result = resolve_repoint(rt, h, old_dir, hash_state(rt, h))
+        except Exception as e:
+            log.error("  XMLRPC error: %s", e)
+            stats["failed"] += 1
+            continue
+
+        if result == "ok":
+            log.info("  ✓ Repointed, still seeding")
+            stats["repointed"] += 1
+            if CLEANUP_OLD:
+                cleanup(content_root(old_dir, name, bool(is_multi)), name)
+        else:
+            stats["failed" if result == "failed" else "pending"] += 1
 
 
 def seed_goal_met(rt, info_hash: str) -> tuple[bool, str]:
@@ -339,14 +464,14 @@ def multi_file_structural_match(torrent: Torrent, new_dir: str, deep_verify: boo
     latter (common) case can't be reseeded in place since rTorrent has no
     per-file path override.
     """
-    new_path = Path(new_dir)
-    root = new_path / torrent.name
+    root = Path(new_dir) / torrent.name
     if not root.is_dir():
         return False
     if not deep_verify:
         return True
     for f in torrent.files:
-        if not (new_path / f["path"]).exists():
+        # f.path is relative to the release folder, not to new_dir
+        if not (root / f["path"]).exists():
             return False
     return True
 
@@ -358,6 +483,9 @@ def verify_files_exist(torrent: Torrent, new_dir: str) -> bool:
     an error state.
     """
     new_path = Path(new_dir)
+    if not new_path.is_dir():
+        log.warning("  Target directory doesn't exist: %s", new_path)
+        return False
 
     # Single file: check torrent.name exists in new_dir
     target = new_path / torrent.name
@@ -394,16 +522,24 @@ def erase_torrent(rt, torrent: Torrent) -> bool:
 
 # ─── Cleanup ─────────────────────────────────────────────────────────────────
 
-def cleanup(torrent: Torrent):
+def cleanup(target: Path, name: str):
     """
-    Remove the old copy from downloads/complete/.
-
-    For both single and multi-file torrents the content root is
-    d.directory / d.name:
+    Remove the old copy from downloads/complete/, given its content_root():
       single-file → /downloads/complete/radarr/movie.mkv       (a file)
       multi-file  → /downloads/complete/radarr/ReleaseGroup/    (a directory)
+
+    Refuses anything that isn't <DOWNLOADS_BASE>/<category>/<torrent name>
+    or deeper — a d.directory that doesn't end in the release name (e.g.
+    after a d.directory_base.set rename) must never rmtree a whole category.
     """
-    target = Path(torrent.directory) / torrent.name
+    try:
+        rel = target.resolve().relative_to(Path(DOWNLOADS_BASE).resolve())
+    except ValueError:
+        rel = None
+    if rel is None or len(rel.parts) < 2 or target.name != name:
+        log.error("  Refusing to delete %s (not <%s>/<category>/<torrent name>)",
+                  target, DOWNLOADS_BASE)
+        return
 
     if not target.exists():
         return
@@ -430,9 +566,29 @@ def main() -> int:
 
     rt = get_rtorrent()
     log_sonarr_naming_config()
+    run_started = time.monotonic()
+
+    stats = {"repointed": 0, "erased": 0, "skipped": 0, "pending": 0, "failed": 0}
+    resume_interrupted(rt, stats)
     torrents = get_pending_torrents(rt)
 
-    stats = {"repointed": 0, "erased": 0, "skipped": 0, "failed": 0}
+    def do_repoint(t: Torrent, new_path: str, kind: str) -> None:
+        if DRY_RUN:
+            log.info("  [DRY RUN] Would repoint directory%s", kind)
+            stats["repointed"] += 1
+            return
+        if time.monotonic() - run_started > RUN_BUDGET:
+            log.info("  Run budget (%.0fs) used up — deferring to the next run", RUN_BUDGET)
+            stats["skipped"] += 1
+            return
+        result = repoint_torrent(rt, t, new_path)
+        if result == "ok":
+            log.info("  ✓ Repointed%s, still seeding", kind)
+            stats["repointed"] += 1
+            if CLEANUP_OLD:
+                cleanup(content_root(t.directory, t.name, t.is_multi_file), t.name)
+        else:
+            stats[result] += 1
 
     for t in torrents:
         log.info("▶ %s  [%s → %s]  hash=%s  multi=%s",
@@ -479,11 +635,12 @@ def main() -> int:
         log.info("  %s → %s", t.directory, new_path)
 
         # ── Multi-file torrents (subfolder) ───────────────────────────
-        # rTorrent resolves files as d.directory/f.path, and f.path
-        # includes the torrent's original root folder name
-        # (e.g. "SomeRelease-GROUP/movie.mkv"). If *arr left that folder
-        # intact under the target directory, d.directory.set + rehash can
-        # still reseed in place (see update_torrent_directory). If *arr
+        # rTorrent resolves files as d.directory/f.path, where d.directory
+        # already ends in the release folder name (e.g.
+        # ".../sonarr/SomeRelease-GROUP") and f.path is relative to it. If
+        # *arr left that folder intact under the target directory,
+        # d.directory.set + rehash can still reseed in place (see
+        # repoint_torrent). If *arr
         # flattened the files directly into the target folder instead (the
         # common case — rTorrent has no per-file path override), we fall
         # back to erasing the torrent and cleaning up.
@@ -499,19 +656,7 @@ def main() -> int:
 
             if structural_match:
                 log.info("  Multi-file torrent — release subfolder intact, attempting repoint")
-
-                if DRY_RUN:
-                    log.info("  [DRY RUN] Would repoint directory (season pack)")
-                    stats["repointed"] += 1
-                    continue
-
-                if update_torrent_directory(rt, t, new_path):
-                    log.info("  ✓ Repointed (season pack), still seeding")
-                    stats["repointed"] += 1
-                    if CLEANUP_OLD:
-                        cleanup(t)
-                else:
-                    stats["failed"] += 1
+                do_repoint(t, new_path, " (season pack)")
                 continue
 
             log.info("  Multi-file torrent — *arr flattened folder, can't reseed")
@@ -525,7 +670,7 @@ def main() -> int:
                 log.info("  ✓ Erased from rTorrent")
                 stats["erased"] += 1
                 if CLEANUP_OLD:
-                    cleanup(t)
+                    cleanup(content_root(t.directory, t.name, t.is_multi_file), t.name)
             else:
                 stats["failed"] += 1
             continue
@@ -542,27 +687,19 @@ def main() -> int:
             log.info("  Seed goal check: %s", reason)
 
         # Verify the file exists at the library path with matching name.
+        # The *_imported label already guarantees the import succeeded, so
+        # a mismatch here is almost always a rename by *arr — permanent,
+        # not a run failure, so it mustn't turn every run red.
         if VERIFY_FILES and not verify_files_exist(t, new_path):
             log.warning("  File verification failed — skipping (rename mismatch?)")
-            stats["failed"] += 1
+            stats["skipped"] += 1
             continue
 
-        if DRY_RUN:
-            log.info("  [DRY RUN] Would repoint directory")
-            stats["repointed"] += 1
-            continue
-
-        if update_torrent_directory(rt, t, new_path):
-            log.info("  ✓ Repointed, still seeding")
-            stats["repointed"] += 1
-            if CLEANUP_OLD:
-                cleanup(t)
-        else:
-            stats["failed"] += 1
+        do_repoint(t, new_path, "")
 
     log.info(
-        "═══ Finished: %d repointed, %d erased, %d skipped, %d failed ═══",
-        stats["repointed"], stats["erased"], stats["skipped"], stats["failed"],
+        "═══ Finished: %d repointed, %d erased, %d skipped, %d pending, %d failed ═══",
+        stats["repointed"], stats["erased"], stats["skipped"], stats["pending"], stats["failed"],
     )
     return 0 if stats["failed"] == 0 else 1
 
