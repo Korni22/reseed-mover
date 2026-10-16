@@ -41,7 +41,10 @@ spec:
               imagePullPolicy: Always
               env:
                 - name: RTORRENT_XMLRPC_URL
-                  value: "http://rtorrent-1.torrent.svc.cluster.local:8080/plugins/httprpc/action.php"
+                  # Direct SCGI port, not ruTorrent's httprpc: its XMLRPCProxy
+                  # sends d.directory.set/d.close/d.check_hash/d.erase untrusted
+                  # and rtorrent >= 0.16.9 rejects them (Fault -507).
+                  value: "http://rtorrent-1.torrent.svc.cluster.local:8000/RPC2"
                 - name: RADARR_URL
                   value: "http://radarr.radarr.svc.cluster.local:7878"
                 - name: SONARR_URL
