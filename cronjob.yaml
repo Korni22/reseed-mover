@@ -25,7 +25,10 @@ spec:
   failedJobsHistoryLimit: 3
   jobTemplate:
     spec:
-      backoffLimit: 1
+      # No retries: exit 1 just means a torrent was reverted or left
+      # pending, and the next scheduled run resolves those anyway. A retry
+      # pod only ran into activeDeadlineSeconds and got killed mid-repoint.
+      backoffLimit: 0
       # Rehashing 2160p files takes minutes each. RUN_BUDGET (default 2400s)
       # stops starting new repoints with HASH_TIMEOUT (default 600s) to spare;
       # a kill mid-repoint is still safe — the next run resolves it.
