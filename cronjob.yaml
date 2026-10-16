@@ -62,11 +62,13 @@ spec:
                 - name: DOWNLOADS_BASE
                   value: "/downloads/complete"
                 - name: DRY_RUN
-                  value: "true"
+                  value: "false"
                 - name: CLEANUP_OLD
                   value: "true"
                 - name: VERIFY_FILES
                   value: "true"
+                # Only gates erasing flattened multi-file torrents (they
+                # stop seeding for good); repoints never wait.
                 - name: MIN_SEED_HOURS
                   value: "140"
               volumeMounts:
