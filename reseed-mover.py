@@ -12,7 +12,11 @@ label to '<service>_imported' (e.g. radarr_imported). This script:
       is still intact under the target directory: stops torrent, updates
       d.directory, rehashes, restarts. Not gated — the torrent keeps
       seeding from the library, so this happens as soon as it's imported.
-  4b. Multi-file torrents where *arr flattened files directly into the
+      Same for multi-file torrents whose files all sit directly in the
+      target directory under their original names and sizes (e.g. a
+      one-.mkv movie release): d.directory_base.set points the torrent
+      at that directory itself.
+  4b. Multi-file torrents where *arr flattened (and renamed) files into the
       target folder (no intact release subfolder) — erases the torrent
       from rTorrent instead. rTorrent has no per-file path override
       (f.path.set doesn't exist), so this case can't be reseeded in place.
@@ -238,7 +242,7 @@ def resolve_repoint(rt, h: str, old_dir: str, state: str) -> str:
     return "failed"
 
 
-def repoint_torrent(rt, torrent: Torrent, new_dir: str) -> str:
+def repoint_torrent(rt, torrent: Torrent, new_dir: str, flat: bool = False) -> str:
     """
     Stop → close → set directory → rehash → wait → start (or revert).
 
@@ -252,6 +256,9 @@ def repoint_torrent(rt, torrent: Torrent, new_dir: str) -> str:
     change the root dir of an open download. d.directory.set auto-appends
     the release name for multi-file torrents, which is what the season-pack
     repoint wants (it only runs once new_dir/<name>/ is confirmed intact).
+    With flat=True, d.directory_base.set points the torrent at new_dir
+    itself instead, for multi-file torrents whose files *arr placed
+    directly in new_dir (see multi_file_flat_match).
     """
     h = torrent.info_hash
     try:
@@ -263,7 +270,10 @@ def repoint_torrent(rt, torrent: Torrent, new_dir: str) -> str:
         save_session(rt, h)
         rt.d.stop(h)
         rt.d.close(h)
-        rt.d.directory.set(h, new_dir)
+        if flat:
+            rt.d.directory_base.set(h, new_dir)
+        else:
+            rt.d.directory.set(h, new_dir)
         rt.d.check_hash(h)
 
         deadline = time.monotonic() + HASH_TIMEOUT
@@ -474,6 +484,25 @@ def multi_file_structural_match(torrent: Torrent, new_dir: str, deep_verify: boo
     return True
 
 
+def multi_file_flat_match(torrent: Torrent, new_dir: str) -> bool:
+    """
+    True if every file in the torrent sits directly under new_dir at its
+    original relative path, with the same size — i.e. *arr dropped the
+    release-folder level but kept the file names (typical for a movie
+    release that is one .mkv in a folder, or a pack imported without
+    renaming). d.directory_base.set(new_dir) then makes rTorrent resolve
+    new_dir/f.path to exactly those files, so it can be reseeded in place.
+    """
+    if not torrent.files:
+        return False
+    root = Path(new_dir)
+    for f in torrent.files:
+        p = root / f["path"]
+        if not p.is_file() or p.stat().st_size != f["size"]:
+            return False
+    return True
+
+
 def verify_files_exist(torrent: Torrent, new_dir: str) -> bool:
     """
     Confirm that the torrent's single file actually exists at the new
@@ -570,7 +599,7 @@ def main() -> int:
     resume_interrupted(rt, stats)
     torrents = get_pending_torrents(rt)
 
-    def do_repoint(t: Torrent, new_path: str, kind: str) -> None:
+    def do_repoint(t: Torrent, new_path: str, kind: str, flat: bool = False) -> None:
         if DRY_RUN:
             log.info("  [DRY RUN] Would repoint directory%s", kind)
             stats["repointed"] += 1
@@ -579,7 +608,7 @@ def main() -> int:
             log.info("  Run budget (%.0fs) used up — deferring to the next run", RUN_BUDGET)
             stats["skipped"] += 1
             return
-        result = repoint_torrent(rt, t, new_path)
+        result = repoint_torrent(rt, t, new_path, flat)
         if result == "ok":
             log.info("  ✓ Repointed%s, still seeding", kind)
             stats["repointed"] += 1
@@ -648,6 +677,11 @@ def main() -> int:
             if structural_match:
                 log.info("  Multi-file torrent — release subfolder intact, attempting repoint")
                 do_repoint(t, new_path, " (season pack)")
+                continue
+
+            if multi_file_flat_match(t, new_path):
+                log.info("  Multi-file torrent — files directly in target folder, attempting repoint")
+                do_repoint(t, new_path, " (flattened)", flat=True)
                 continue
 
             log.info("  Multi-file torrent — *arr flattened folder, can't reseed")
