@@ -16,12 +16,19 @@ label to '<service>_imported' (e.g. radarr_imported). This script:
       target directory under their original names and sizes (e.g. a
       one-.mkv movie release): d.directory_base.set points the torrent
       at that directory itself.
-  4b. Multi-file torrents where *arr flattened (and renamed) files into the
-      target folder (no intact release subfolder) — erases the torrent
-      from rTorrent instead. rTorrent has no per-file path override
-      (f.path.set doesn't exist), so this case can't be reseeded in place.
-      Held until MIN_SEED_HOURS/MIN_SEED_RATIO are met.
-  5. Deletes the old copy from /downloads/complete/
+  4b. Multi-file torrents where *arr imported only some of the files
+      directly into the target folder (e.g. a season pack whose bonus
+      .mkv or .nfo matched no episode): the files *arr skipped are copied
+      from the download into the target folder under their original
+      names, then the torrent is repointed as in 4a. Only done when every
+      file either already matches (name + size) at the target or doesn't
+      exist there at all — a same-named file with a different size is
+      never overwritten.
+  4c. Anything else (e.g. *arr renamed the files) can't be reseeded in
+      place — rTorrent has no per-file path override (f.path.set doesn't
+      exist). The torrent is left alone: never erased, never deleted.
+  5. After a successful repoint, deletes the old copy from
+     /downloads/complete/ (the torrent now seeds from the library)
 
 Environment variables:
   RTORRENT_XMLRPC_URL   rTorrent XMLRPC endpoint    (default: http://rutorrent:8080/RPC2)
@@ -33,10 +40,6 @@ Environment variables:
   DRY_RUN               Log only, don't change        (default: false)
   CLEANUP_OLD           Delete old copy after move    (default: true)
   VERIFY_FILES          Check files exist before move (default: true)
-  MIN_SEED_HOURS        Don't erase a torrent (4b)    (default: 0 = off)
-                        until it's seeded this long
-  MIN_SEED_RATIO        Same, gated on ratio instead   (default: 0 = off)
-                        (both 0 = old behavior, no gate)
   HASH_TIMEOUT          Seconds to wait for a rehash   (default: 600)
                         before leaving it to the next run
   RUN_BUDGET            Seconds after which no new     (default: 2400)
@@ -73,8 +76,6 @@ DOWNLOADS_BASE = os.getenv("DOWNLOADS_BASE", "/downloads/complete")
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 CLEANUP_OLD = os.getenv("CLEANUP_OLD", "true").lower() == "true"
 VERIFY_FILES = os.getenv("VERIFY_FILES", "true").lower() == "true"
-MIN_SEED_HOURS = float(os.getenv("MIN_SEED_HOURS", "0"))
-MIN_SEED_RATIO = float(os.getenv("MIN_SEED_RATIO", "0"))
 HASH_TIMEOUT = float(os.getenv("HASH_TIMEOUT", "600"))
 RUN_BUDGET = float(os.getenv("RUN_BUDGET", "2400"))
 
@@ -331,31 +332,6 @@ def resume_interrupted(rt, stats: dict) -> None:
             stats["failed" if result == "failed" else "pending"] += 1
 
 
-def seed_goal_met(rt, info_hash: str) -> tuple[bool, str]:
-    """
-    Check whether MIN_SEED_HOURS / MIN_SEED_RATIO have been satisfied.
-
-    Both are 0 (disabled) by default, which reproduces the old behavior —
-    set at least one via env vars to stop erase_torrent()/cleanup() from
-    running before your tracker's seeding requirements are met.
-    """
-    if MIN_SEED_HOURS <= 0 and MIN_SEED_RATIO <= 0:
-        return True, "no seed gate configured"
-
-    finished_ts = rt.d.timestamp.finished(info_hash)
-    if finished_ts <= 0:
-        return False, "rTorrent hasn't marked this finished yet"
-
-    seeded_hours = (time.time() - finished_ts) / 3600
-    ratio = rt.d.ratio(info_hash) / 1000.0  # rTorrent reports ratio × 1000
-
-    if MIN_SEED_HOURS > 0 and seeded_hours < MIN_SEED_HOURS:
-        return False, f"seeded {seeded_hours:.1f}h / needs {MIN_SEED_HOURS}h (ratio {ratio:.2f})"
-    if MIN_SEED_RATIO > 0 and ratio < MIN_SEED_RATIO:
-        return False, f"ratio {ratio:.2f} / needs {MIN_SEED_RATIO} (seeded {seeded_hours:.1f}h)"
-    return True, f"seeded {seeded_hours:.1f}h, ratio {ratio:.2f} — goal met"
-
-
 # ─── *arr API helpers ────────────────────────────────────────────────────────
 
 def arr_get(service: str, endpoint: str, params: dict | None = None) -> dict | list:
@@ -536,15 +512,72 @@ def verify_files_exist(torrent: Torrent, new_dir: str) -> bool:
     return False
 
 
-def erase_torrent(rt, torrent: Torrent) -> bool:
-    """Remove the torrent entry from rTorrent entirely (d.erase)."""
-    try:
-        rt.d.stop(torrent.info_hash)
-        rt.d.erase(torrent.info_hash)
-        return True
-    except Exception as e:
-        log.error("  XMLRPC erase error: %s", e)
-        return False
+def plan_missing_files(torrent: Torrent, new_dir: str) -> list[dict] | None:
+    """
+    For a multi-file torrent *arr imported only partly into new_dir (files
+    flattened, original names kept), return the files it skipped — the ones
+    to copy over from the download so multi_file_flat_match() succeeds.
+
+    Returns None — meaning "don't touch it" — unless every file either
+    already sits at new_dir/f.path with the right size, or is absent there
+    and complete in the download. Also None if nothing matched at all
+    (then new_dir isn't where this release went, and copying the whole
+    pack there would be wrong) or a path would escape new_dir.
+    """
+    if not torrent.files:
+        return None
+    root = Path(new_dir)
+    src_root = content_root(torrent.directory, torrent.name, torrent.is_multi_file)
+    matched, missing = 0, []
+    for f in torrent.files:
+        rel = Path(f["path"])
+        if rel.is_absolute() or ".." in rel.parts:
+            log.warning("  Unsafe file path in torrent: %s", f["path"])
+            return None
+        dst = root / rel
+        if dst.exists():
+            if dst.is_file() and dst.stat().st_size == f["size"]:
+                matched += 1
+                continue
+            log.info("  %s exists at target with a different size — not overwriting", rel)
+            return None
+        src = src_root / rel
+        if not src.is_file() or src.stat().st_size != f["size"]:
+            log.info("  %s missing at target and incomplete in the download", rel)
+            return None
+        missing.append(f)
+    if matched == 0:
+        return None
+    return missing
+
+
+def copy_missing_files(torrent: Torrent, new_dir: str, missing: list[dict]) -> bool:
+    """
+    Copy the files plan_missing_files() found into new_dir under their
+    original relative paths. Each goes to a temp name first and is renamed
+    once its size checks out, so an interrupted copy never leaves a
+    truncated file under the real name (which would fail the rehash).
+    """
+    src_root = content_root(torrent.directory, torrent.name, torrent.is_multi_file)
+    for f in missing:
+        src = src_root / f["path"]
+        dst = Path(new_dir) / f["path"]
+        tmp = dst.with_name(dst.name + ".reseed-partial")
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src, tmp)
+            if tmp.stat().st_size != f["size"]:
+                raise OSError(f"size mismatch after copy ({tmp.stat().st_size} != {f['size']})")
+            os.replace(tmp, dst)
+            log.info("  Copied %s (%.1f GiB)", f["path"], f["size"] / 2**30)
+        except OSError as e:
+            log.error("  Copy of %s failed: %s", f["path"], e)
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return False
+    return True
 
 
 # ─── Cleanup ─────────────────────────────────────────────────────────────────
@@ -595,7 +628,7 @@ def main() -> int:
     log_sonarr_naming_config()
     run_started = time.monotonic()
 
-    stats = {"repointed": 0, "erased": 0, "skipped": 0, "pending": 0, "failed": 0}
+    stats = {"repointed": 0, "skipped": 0, "pending": 0, "failed": 0}
     resume_interrupted(rt, stats)
     torrents = get_pending_torrents(rt)
 
@@ -667,10 +700,11 @@ def main() -> int:
         # ".../sonarr/SomeRelease-GROUP") and f.path is relative to it. If
         # *arr left that folder intact under the target directory,
         # d.directory.set + rehash can still reseed in place (see
-        # repoint_torrent). If *arr
-        # flattened the files directly into the target folder instead (the
-        # common case — rTorrent has no per-file path override), we fall
-        # back to erasing the torrent and cleaning up.
+        # repoint_torrent). If *arr flattened the files directly into the
+        # target folder, d.directory_base.set does the same — provided every
+        # file is there, so files *arr skipped get copied over first. Renamed
+        # files can't be reseeded (rTorrent has no per-file path override);
+        # those torrents are left alone, never erased.
         if t.is_multi_file:
             structural_match = multi_file_structural_match(t, new_path, deep_verify=VERIFY_FILES)
 
@@ -684,29 +718,31 @@ def main() -> int:
                 do_repoint(t, new_path, " (flattened)", flat=True)
                 continue
 
-            log.info("  Multi-file torrent — *arr flattened folder, can't reseed")
-
-            # Erasing ends seeding for good, so only this path is gated —
-            # repoints keep seeding and never wait.
-            met, reason = seed_goal_met(rt, t.info_hash)
-            if not met:
-                log.info("  Seed goal not met yet (%s) — leaving in place", reason)
-                stats["skipped"] += 1
+            missing = plan_missing_files(t, new_path)
+            if missing:
+                total = sum(f["size"] for f in missing)
+                log.info("  Multi-file torrent — %d of %d file(s) not imported by %s (%.1f GiB), "
+                         "copying them to the target before repointing",
+                         len(missing), len(t.files), t.service, total / 2**30)
+                for f in missing:
+                    log.info("    + %s", f["path"])
+                if DRY_RUN:
+                    log.info("  [DRY RUN] Would copy the above, then repoint directory (completed)")
+                    stats["repointed"] += 1
+                    continue
+                if time.monotonic() - run_started > RUN_BUDGET:
+                    log.info("  Run budget (%.0fs) used up — deferring to the next run", RUN_BUDGET)
+                    stats["skipped"] += 1
+                    continue
+                if not copy_missing_files(t, new_path, missing):
+                    stats["failed"] += 1
+                    continue
+                do_repoint(t, new_path, " (completed)", flat=True)
                 continue
-            log.info("  Seed goal check: %s", reason)
 
-            if DRY_RUN:
-                log.info("  [DRY RUN] Would erase torrent and delete old files")
-                stats["erased"] += 1
-                continue
-
-            if erase_torrent(rt, t):
-                log.info("  ✓ Erased from rTorrent")
-                stats["erased"] += 1
-                if CLEANUP_OLD:
-                    cleanup(content_root(t.directory, t.name, t.is_multi_file), t.name)
-            else:
-                stats["failed"] += 1
+            log.info("  Multi-file torrent — files renamed or not where expected, can't reseed "
+                     "in place; leaving it in rTorrent untouched")
+            stats["skipped"] += 1
             continue
 
         # ── Single-file torrents ──────────────────────────────────────
@@ -722,8 +758,8 @@ def main() -> int:
         do_repoint(t, new_path, "")
 
     log.info(
-        "═══ Finished: %d repointed, %d erased, %d skipped, %d pending, %d failed ═══",
-        stats["repointed"], stats["erased"], stats["skipped"], stats["pending"], stats["failed"],
+        "═══ Finished: %d repointed, %d skipped, %d pending, %d failed ═══",
+        stats["repointed"], stats["skipped"], stats["pending"], stats["failed"],
     )
     return 0 if stats["failed"] == 0 else 1
 

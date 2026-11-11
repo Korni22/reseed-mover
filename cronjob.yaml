@@ -8,7 +8,8 @@
 #     --from-literal=SONARR_API_KEY=your-sonarr-key
 #
 # The pod needs read-write access to /downloads (cleanup() deletes the old
-# copy there) and read-only access to /media (verify files before repointing).
+# copy there) and to /media (it verifies files before repointing, and copies
+# in files of a partly imported pack that *arr skipped).
 
 apiVersion: batch/v1
 kind: CronJob
@@ -70,17 +71,13 @@ spec:
                   value: "true"
                 - name: VERIFY_FILES
                   value: "true"
-                # Only gates erasing flattened multi-file torrents (they
-                # stop seeding for good); repoints never wait.
-                - name: MIN_SEED_HOURS
-                  value: "140"
               volumeMounts:
                 - name: downloads
                   mountPath: /downloads
                   readOnly: false
                 - name: media
                   mountPath: /media
-                  readOnly: true
+                  readOnly: false
               resources:
                 requests:
                   cpu: 50m
